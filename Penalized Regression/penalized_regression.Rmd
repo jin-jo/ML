@@ -1,0 +1,304 @@
+---
+title: "Tidymodels for Penalized Regression"
+author: "Jin Seo Jo"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We will work through how to fit ridge regression models using tidy models.
+
+Ridge regression is an attempt to imporve the generlaizabiliy of linear regression when there are a lot of potentially correlated features. It tries to do this by imposing a penality on the size of the regression coefficients.
+
+So if the model is 
+$$y_{i} = \beta_{0} + x_{i}^T\beta + \epsilon_{i}$$
+then instead of just computing the least squares estimate of $\beta$, ridge regression instead minimizes the modified or penalized loss function
+$$ \sum_{i=1}^{n}(y_{i}-\beta_{0}-x_{i}^T\beta) + \lambda\|\beta\|_{2}^{2}$$
+where $\lambda$ is an unknown parameter that trades of fit (we get standard regression as $\lambda \rightarrow 0$) and generalizability.
+
+The example is a TidyTuesday data set about The Office. We will predict the IMDb rating from characteristics about the episodes.
+
+## Step1: Download and clean the ratings data
+Removing common but unimportant things in the episode names.
+```{r, message=FALSE}
+library(tidyverse)
+
+ratings_raw <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-03-17/office_ratings.csv")
+
+remove_regex <- "[:punct:]|[:digit:]|parts |part |the |and"
+
+office_ratings <- ratings_raw %>%
+  # transmute() adds new variables and drops existing ones.
+  transmute(
+    episode_name =str_to_lower(title),
+    # str_remove_all() removes matched patterns in a string.
+    episode_name =str_remove_all(episode_name, remove_regex),
+    # str_trim() removes whitespace from start and end of string.
+    episode_name =str_trim(episode_name),
+    imdb_rating
+    )
+```
+
+The `office_ratings` is _wild_. It is the entire script of The Office! It lives in the `schrute` package. (Notice the overlap, but it's good practice to pretend that `imdb_rating` column isn't there.)  
+
+```{r}
+# install.packages("schrute")
+library(schrute)
+
+schrute::theoffice
+```
+
+Let's take that and get rid of all of the boring talking, but keep information that might be useful for predicting IMDB ratings. 
+
+```{r}
+office_info <- schrute::theoffice %>% 
+  mutate(season = as.numeric(season),
+         episode = as.numeric(episode),
+         episode_name = str_to_lower(episode_name),
+         episode_name = str_remove_all(episode_name, remove_regex), 
+         episode_name = str_trim(episode_name)) %>%
+  select(season, episode, episode_name, director, writer, character)
+
+office_info
+```
+
+We are going to collect a few other things:  
+- How often characters speak per episode  
+- Who was involved in writing and directing  
+
+Characters speak per episode:
+```{r}
+characters <- office_info %>% 
+  count(episode_name, character) %>%
+  add_count(character, wt = n, name = "character_count") %>% 
+  filter(character_count > 800) %>%
+  select(-character_count) %>%
+  pivot_wider(
+    names_from = character,
+    values_from = n,
+    values_fill = list(n = 0)
+  )
+
+characters
+```
+
+The writers and directors:
+```{r}
+creators <- office_info %>% 
+  distinct(episode_name, director, writer) %>% # Beware of utiples and drop cols
+  pivot_longer(cols = director:writer,
+               names_to = "role",
+               values_to = "person") %>% 
+  separate_rows(person, sep = ";") %>% # One row per person
+  add_count(person) %>% # Do the counting
+  filter(n > 10) %>% # Throw out the rare people
+  distinct(episode_name, person) %>% # Make sure it's distinct
+  mutate(person_value = 1) %>% 
+  pivot_wider(
+    names_from = person, 
+    values_from = person_value,
+    values_fill = list(person_value = 0)
+  )
+
+creators  
+```
+
+Now that we've got all of those things sorted out, we need to join them together.  
+
+All of the tibbles `office_info`, `characters`, and `creators` have one common column: `episode_name`. We can use this to join them together to get a final data set.  
+
+The magic function here is `ineer_join`. This is a great example of a Two Table Verb, so called becuase it acts on two tables. The purpose of `inner_join` is to join these two tables in such a way that the output has all of the rows that are in **both** tables.  
+
+This is an example:
+```{r}
+df1 <- tibble(x = c(1, 2), y = 2:1)
+df2 <- tibble(x = c(3, 1), a = 10, b = "a")
+inner_join(df1, df2, by = "x")
+```
+
+See that this has kept _only_ the row that had a common value of x (the **by** argument).  
+(When we skip the **by** argument, it will just try to join on everything that is common.)  
+
+Other types of joins:  
+- `left_join()` includes all rows in the first table  
+- `right_join()` includes all rows in the second table  
+- `full_join()` includes all rows in either table 
+
+Let's do it with the data. We are also hitting it with a `janitor::clean_names()`, which is a wonderful way to clean up the column headings and remove any odd puntuation or capitalization or any other type of non-standard thing. 
+```{r}
+office <- office_info %>% 
+  distinct(season, episode, episode_name) %>% 
+  inner_join(characters) %>% 
+  inner_join(creators) %>% 
+  inner_join(office_ratings %>% 
+               select(episode_name, imdb_rating)) %>% 
+  janitor::clean_names()
+
+office
+```
+Now our data is clean, we can do some modelling. 
+
+## Organize the data
+The first step in any pipeline is always building a recipe to make our data analysis standard and to allow us to document the transformations we made.  
+First, we need to split our data. Because we are going to be doing complicated things later, we need to split our data into a test and training set.  
+
+The `rsample` package, which is part of `tidymodels` makes this a breeze. 
+```{r, message=FALSE}
+library(tidymodels)
+```
+
+```{r}
+office_split <- initial_split(office, strata = season)
+office_train <- training(office_split)
+office_test <- testing(office_split)
+```
+- The `initial_split()` function has a **prop** argument that controls how much data is in the training set. The default value **prop = 0.75** is fine for our purposes.  
+- The `strata` argument makes sure this 75/25 split is carried out for each season. Typically, the variable you want to stratify by is any variable that will have uneven sampling.  
+- The `training()` and `testing()` functions extract the test and training data sets.  
+
+## Build a recipe
+For predictive modelling, we need to specify which column is being predicted. The `recipe()` function takes a formula argument, which controls this. For the moment, we are just going to regress `imdb_rating` against everything else, so our formula is `imdb_rating ~ .`. We also need to do this to the training data.
+```{r}
+office_rec <- recipe(imdb_rating ~ ., data = office_train) %>% 
+  update_role(episode_name, new_role = "ID") %>% 
+  step_zv(all_numeric(), -all_outcomes()) %>% 
+  step_normalize(all_numeric(), -all_outcomes())
+```
+
+So there are three more steps.  
+- The first one labels the column `episode_name` as an "ID" column, which is basically just a column that we keep around for fun and plotting, but we don't want to be in our model.  
+- `step_zv` removes any column that has zero variance (i.e. is all the same value). We are applying this to all numeric columns, but not to the outcomes. (In this case, the outcome is `imdb_rating`.)  
+- We are normalizing all of the numeric columns that are the outcome.  
+
+Now we can actually prepare that recipe with the `prep` function. This does things like calculate the centering and the scaling. It does not apply them yet!
+
+The `string_as_factors = FALSE` argument is just to make sure that `episode_name` isn't converted.
+```{r}
+office_prep <- office_rec %>% 
+  prep(strings_as_factors = FALSE)
+```
+
+## Fit the ridge regression
+We will fit this ridge regression with a package called `glmnet`. But we are going to use tidymodel bindings so we don't have to work too hard to understand how to use it. One of the best things that tidymodels does is provide a clean and common interfact to these functions.  
+
+We specify a model with two things: A _specification_ and an _engine_.
+```{r}
+ridge_reg_spec <- linear_reg(penalty = 0.3, mixture = 0) %>% 
+  set_engine("glmnet")
+
+ridge_reg_spec
+```
+
+It tells us that  
+- we are doing a linear regression-type problem (that tells us what loss function we are using).  
+- we have set the penalty parameter $\lambda = 0.3$. This is arbitrary. We will learn how to find it from data later.  
+- `mixture = 0` says we should do ridge regression. `mixture = 1` uses the LASSO.  
+
+And the `set_engine()` function tells the specification exactly what package to use. (There are multiple options.)
+
+### Workflows
+When we are doing real data analysis, there are often multiple models and multiple data sets lying around. `tidymodels` has a nice concept to ensure that a particular recipe and a particular model specification can _stay_ linked. This is a workflow.
+
+We don't need anything advanced here, so for this one moment we are going to just add the data recipe to the workflow. 
+```{r}
+wf_rr <- workflow() %>% 
+  add_recipe(office_rec)
+
+wf_rr
+```
+
+### Fit the model
+To fit the model, we add its specification to the workflow and then call the `fit` fcuntion.
+```{r}
+simple_rr_fit <- wf_rr %>% 
+  add_model(ridge_reg_spec) %>% 
+  fit(data = office_train)
+```
+
+We can then view the fit by "pulling" it out of the workflow.
+```{r}
+simple_rr_fit %>% 
+  pull_workflow_fit() %>% 
+  tidy()
+```
+
+We probably shouldn't just choose an arbitrary value for the penalty.  
+
+We really need to work out some sort of value for this tuning parameter. Unsurprisingly, there is a way to do that in tidymodels. Instead of giving `penalty` a specific value we can set it to the function `tune()`.  
+
+The new spec looks like this.
+```{r}
+tune_rr_spec <- linear_reg(penalty = tune(), mixture = 0) %>% 
+  set_engine("glmnet")
+```
+
+We need to have some idea of what values to try. Because the bad news is that we are basically going to just fit this model  a lot for a range of different penalty values. There's a helper function for this called `grid_regular()` and another function called `penalty()` that knows things about what a penalty has to look like.  
+
+But if you want to, you can just make a one column tibble with a column called `penalty` with whatever values you want. I'm going to choose 20 values that are evenly spaced in log space. 
+```{r}
+lambda_grid <- grid_regular(penalty(), levels = 20)
+
+lambda_grid
+```
+
+### Finding $\lambda$
+We will try to find a value of $\lambda$ that has the smallest estimated test error. We can get this through Cross Validation. We need to do this because we do not want to touch our test set.
+
+We are going to use k-fold, where the data is randomly split into k groups of roughly equal sizes (these are called the folds). We can use the `vfold_cv()` function to do this. We are going to do these splits in a stratified manner again, because if you need to stratify by a variable at one point in the analysis you need to do at every point for the same reason. 
+
+This will make 1- lists with various things in them, including the subset of the data. 
+```{r}
+folds <- vfold_cv(office_train, v = 10, strata = season)
+folds
+```
+
+```{r}
+folds$splits[[1]]$data
+```
+
+Now we can actually tune our model to find a good value of $\lambda$
+```{r}
+wf_rr <- wf_rr %>% add_model(tune_rr_spec)
+
+rr_grid <- tune_grid(
+  wf_rr,
+  resamples = folds,
+  grid = lambda_grid
+)
+```
+
+We collected a bunch of metrics that we can now look at.
+```{r}
+rr_grid %>% collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean, colour = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line() +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+```
+
+Note that "rmse" represents the root mean squared error, and "rsq" represents R-squared. 
+
+We see that a relatively large penalty is good. We can select the best one!
+```{r}
+lowest_rmse <- rr_grid %>% select_best("rmse") # We want it small
+
+lowest_rmse
+```
+
+```{r}
+final_rr <- finalize_workflow(wf_rr, lowest_rmse)
+
+final_rr
+```
+
+Now with our workflow finalized, we can finally fit this model on the whole training set, and then evaluate it on the test set.
+```{r}
+last_fit(final_rr, office_split) %>% 
+  collect_metrics()
+```
+
+
