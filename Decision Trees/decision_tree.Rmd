@@ -1,0 +1,151 @@
+---
+title: 'Decision trees'
+author: "Jin Seo Jo"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Cell images
+
+We are going to look at an example where the data is an evaluation of automatic cell segmentation algorithms. For each cell, an automated agorithm is run to try and detect cell boundaries, and then a human looks at the output and declares the cell to be "well segmented" (`WS`) or "poorly segmented" (`PS`). More infomation about the data can be found [here](https://www.tidymodels.org/start/resampling/).
+
+The human is expensive, so we want to see if there are measurable characteristics of the cell that can predicit whether or not a cell is well segmented. If this is accurate it can massively reduce the human cost to analysing this sort of data.
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(modeldata)
+data(cells)
+cells <- cells %>% select(-case)
+cells
+```
+
+Look for imbalance in this data and prepare test and training sets taking to account any imbalance. Check if the test and training sets are balanced.
+
+```{r, echo = FALSE}
+cells %>% 
+  count(class) %>% 
+  mutate(prop = n/sum(n))
+cell_split <- initial_split(cells, strata = class)
+test <- testing(cell_split)
+train <- training(cell_split)
+
+test %>% 
+  count(class) %>% 
+  mutate(prop = n/sum(n))
+
+train %>% 
+  count(class) %>% 
+  mutate(prop = n/sum(n))
+```
+
+This data is all organized pretty nicely so we don't really need a recipe. This means that instead of an `add_recipe` step we can use `add_formula` when building our workflow.
+
+### A random forest model
+Random forests are pretty charming because we don't really need to do much to tune them. In `R`, they can be fit using the `ranger` package.  We set up the model like this.
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>%
+  set_mode("classification")
+```
+
+Here the argument `trees` controls how many trees should be grown as part of the random forest. We can then build our workflow. 
+
+```{r}
+wf_rf <- workflow() %>% add_model(rf_spec ) %>% add_formula(class ~ .)
+```
+
+We can now fit the random forest.
+
+Fit the model on the entire training data and estimate the  `accuracy` and `roc_auc` on the _training_ set. Compare that to these metrics on the _test_ set.  
+
+Note: We will need to predict twice: once with `type = "class` and once with `type = "prob"`.
+
+```{r, echo = FALSE}
+fit_rf <- wf_rf %>% fit(data = train)
+
+pred_training_rf <- predict(fit_rf, train) %>% 
+  bind_cols(predict(fit_rf, train, type = "prob")) %>%
+  bind_cols(train %>% select(class))
+
+pred_training_rf %>% roc_auc(truth = class, .pred_PS)
+pred_training_rf %>% accuracy(truth = class, .pred_class)
+
+pred_test_rf <- predict(fit_rf, test) %>% 
+  bind_cols(predict(fit_rf, test, type = "prob")) %>%
+  bind_cols(test %>% select(class))
+
+pred_test_rf %>% roc_auc(truth = class, .pred_PS)
+pred_test_rf %>% accuracy(truth = class, .pred_class)
+
+```
+
+We should have noticed that the training error was too optimistic. We can fix that by using cross validation with `fit_resamples` to fit a separate random forest to each fold.
+
+```{r}
+folds <- vfold_cv(test, v = 10)
+fit_rf_resample <- wf_rf %>% fit_resamples(folds)
+fit_rf_resample %>% collect_metrics()
+```
+
+Much better!
+
+## Now let's compare with decision trees
+
+We can also fit the data using a single decision tree. But in this case we will need to do more work to tune it!
+
+Parsnip has a `decision_tree` function, which is driven by the `rpart` package.  There are several parameters to tune, but the key ones are the `cost_complexity`, which controls the pruning, and `tree_depth` which controls how deep the initial tree is grown before being pruned.
+
+```{r}
+spec_dt <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune()
+  ) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+grid_dt <- grid_regular(cost_complexity(), tree_depth(), levels = 5)
+grid_dt
+```
+
+Fit and tune this model and plot the metrics (x-axis: cost_complexity, y-axis: metric, colour: tree_depth).
+
+```{r, echo = FALSE}
+wf_dt <- workflow() %>% add_model(spec_dt) %>% add_formula(class ~ .)
+
+fit_tree <- wf_dt %>% 
+  tune_grid(resamples = folds, grid = grid_dt)
+
+fit_tree %>% collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>% #better plotting
+  ggplot(aes(cost_complexity, mean, colour = tree_depth)) +
+  geom_line(size = 2, alpha = 0.5) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ .metric, scales = "free") +
+  scale_x_log10()
+
+fit_tree %>% show_best()
+
+best_tree <- select_best(fit_tree, "roc_auc")
+```
+
+Once we finalize the workflow we can look at the best tree!
+
+```{r}
+wf_dt_final <- wf_dt %>% finalize_workflow(best_tree)
+final_tree <- wf_dt_final %>% fit(train)
+final_tree
+```
+
+We can also look at variable imporance plots using the `vip` package.
+
+```{r}
+library(vip)
+final_tree %>% pull_workflow_fit() %>% vip()
+```
+
+
